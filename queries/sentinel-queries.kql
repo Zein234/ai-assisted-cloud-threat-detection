@@ -1,0 +1,199 @@
+// Shows all SSH login attempts (both successful and failed) in the last hour, 
+// including the time of the attempt, the computer name, the facility, severity level, process ID, process name, and the syslog message.
+Syslog
+| where TimeGenerated >= ago(1h)
+| where ProcessName == "sshd"
+| where SyslogMessage startswith "Accepted " or SyslogMessage startswith "Invalid user"
+| project TimeGenerated, Computer, Facility, SeverityLevel, ProcessID, ProcessName, SyslogMessage
+| order by TimeGenerated desc
+
+
+// Invalid user SSH login detection:
+// Detects 5 or more invalid SSH authentication attempts using invalid usernames from the same source IP address within a 10 minute window. 
+// Rule frequence set to run every 5 minutes, and lookback window set to 10 minutes, therefore only detect failed logins that occurred within the last 5 minutes, removing duplicate alerts for the same incident.
+// This may indicate SSH brute force activity or username enumeration.
+Syslog
+| where TimeGenerated >= ago(10m)
+| where ProcessName == "sshd"
+| where SyslogMessage startswith "Invalid user"
+| parse-where SyslogMessage with "Invalid user " AttemptedUser " from " SourceIP " port " SourcePort:int
+| summarize
+        AttemptCount = count(),
+        UniqueUsers = dcount(AttemptedUser),
+        AttemptedUsers = make_set(AttemptedUser),
+        FirstFailure = min(TimeGenerated),
+        LastFailure = max(TimeGenerated)
+    by SourceIP, Computer
+| where AttemptCount >= 5
+| where LastFailure >= ago(5m)
+| project 
+    TimeGenerated = LastFailure,
+    SourceIP,
+    Computer,
+    AttemptCount,
+    UniqueUsers,
+    AttemptedUsers,
+    FirstFailure,
+    LastFailure
+| order by TimeGenerated desc
+
+
+// Successful authenitcation after multiple failed attempts:
+// Detects a successful SSH authentication within 15 minutes after 5 or more invalid SSH authentication attempts,
+// using invalid usernames from the same source IP address. 
+// Rule frequence set to run every 5 minutes, 
+// therefore only detect successful logins that occurred within the last 5 minutes, removing duplicate alerts for the same incident.
+// This may indicate SSH brute force activity or username enumeration.
+let FailedAttempts = 
+    Syslog
+    | where ProcessName == "sshd"
+    | where SyslogMessage startswith "Invalid user"
+    | parse-where SyslogMessage with "Invalid user " AttemptedUser " from " SourceIP " port " SourcePort:int
+    | project 
+        FailTime = TimeGenerated,
+        Computer,
+        AttemptedUser,
+        SourceIP,
+        SourcePort;
+let SuccessfullAttempts = 
+    Syslog
+    | where ingestion_time() > ago(5m)
+    | where ProcessName == "sshd"
+    | where SyslogMessage startswith "Accepted "
+    | parse-where SyslogMessage with "Accepted " AuthenticationMethod " for " AuthenticatedUser " from " SourceIP " port " SuccessSourcePort:int " ssh2: " *
+    | project 
+        SuccessTime = TimeGenerated,
+        Computer,
+        AuthenticationMethod,
+        AuthenticatedUser,
+        SourceIP,
+        SuccessSourcePort;
+SuccessfullAttempts
+| join kind=inner (FailedAttempts)
+    on SourceIP, Computer
+|where FailTime < SuccessTime and FailTime >= SuccessTime - 15m
+| summarize
+        AttemptCount = count(),
+        UniqueUsers = dcount(AttemptedUser),
+        AttemptedUsers = make_set(AttemptedUser),
+        FirstFailure = min(FailTime),
+        LastFailure = max(FailTime)
+    by SourceIP, Computer, SuccessTime, AuthenticatedUser, AuthenticationMethod, SuccessSourcePort
+| where AttemptCount >= 5
+| project 
+    TimeGenerated = SuccessTime,
+    Computer,
+    SourceIP,
+    AttemptCount,
+    UniqueUsers,
+    AttemptedUsers,
+    FirstFailure,
+    LastFailure,
+    SuccessTime,
+    AuthenticatedUser,
+    AuthenticationMethod,
+    SuccessSourcePort
+
+
+// Investigation query, 
+// used to show activity from a suspicious source IP.
+// Done manually by replacing <SOURCE_IP_FROM_INCIDENT> with the source IP address from the incident.
+let InvestigatedIP = "<SOURCE_IP_FROM_INCIDENT>";
+Syslog
+| where TimeGenerated between (datetime(YYYY-MM-DD HH:MM:SS) .. datetime(YYYY-MM-DD HH:MM:SS))
+| where SyslogMessage contains InvestigatedIP
+| project
+    TimeGenerated,
+    Computer,
+    ProcessName,
+    Facility,
+    SeverityLevel,
+    SyslogMessage
+| order by TimeGenerated asc
+
+
+
+// User creation detection:
+// Detects new user creation events and the initiating user that created the new user.
+let UserCreated =
+Syslog
+| parse-where SyslogMessage with "new user: name=" NewUser ", UID=" UID:int ", GID=" GID:int ", home=" home ", shell=" shell ", from=" terminal
+| project CreationTime=TimeGenerated, Computer, NewUser, UID, GID, home, shell, terminal;
+let InitiatingUser = 
+Syslog
+| where SyslogMessage has "adduser" or SyslogMessage has "useradd"
+| parse SyslogMessage with InitialUser " : TTY=" TTY " PWD=" PWD " USER=" ExecutedAs "COMMAND=" COMMAND
+| project InitiatingTime = TimeGenerated, Computer, InitialUser, TTY, PWD, ExecutedAs, COMMAND, NewUser = tostring(split(COMMAND, " ")[-1]);
+UserCreated 
+| join kind=leftouter (InitiatingUser) on Computer, NewUser
+| where (InitiatingTime <= CreationTime and CreationTime - InitiatingTime <= 1m) or isnull(InitiatingTime)
+| project CreationTime, Computer, NewUser, UID, GID, InitialUser, Command = COMMAND, ExecutedAs
+
+
+// User privilege escalation detection:
+// Detects when a user is granted sudo privileges and the initiating user that granted the privileges.
+let UserGranted =
+Syslog
+| parse-where SyslogMessage with "add '" NewUser "' to group 'sudo'"
+| project PrivilegeGrantedTime = TimeGenerated, Computer, NewUser;
+let GrantingUser =
+Syslog
+| where SyslogMessage contains "usermod" and SyslogMessage has "sudo"
+| parse-where SyslogMessage with InitialUser " : TTY=" TTY " PWD=" PWD " USER=" ExecutedAs "COMMAND=" COMMAND
+| project GrantingTime = TimeGenerated, Computer, InitialUser, TTY, PWD, ExecutedAs, COMMAND, NewUser = tostring(split(COMMAND, " ")[-1]);
+UserGranted
+| join kind=leftouter (GrantingUser) on Computer, NewUser
+| where (GrantingTime <= PrivilegeGrantedTime and PrivilegeGrantedTime - GrantingTime <= 1m) or isnull(GrantingTime)
+| project PrivilegeGrantedTime, Computer, UserGrantedSudo = NewUser, GrantingUser = InitialUser, Command = COMMAND, ExecutedAs
+
+
+// Failed Windows logon attempts detection:
+// Detects 5 or more failed Windows logon attempts from the same source IP address within a 10 minute window. 
+// Rule frequence set to run every 5 minutes, therefore only detect failed logins that occurred within the last 5 minutes, removing duplicate alerts for the same incident.
+// This may indicate brute force activity
+SecurityEvent
+| where TimeGenerated >= ago(10m)
+| where EventID == 4625
+| summarize 
+    LogInAttempts = count(),
+    TargetAccounts = make_set(TargetUserName),
+    FirstFailure = min(TimeGenerated),
+    LastFaliure = max(TimeGenerated),
+    LogonTypes = make_set(LogonTypeName),
+    FailureCodes = make_set(strcat(Status, " / ", SubStatus))
+    by IpAddress, Computer
+| where LogInAttempts >= 5
+| where LastFaliure >= ago(5m)
+| project 
+    TimeGenerated = LastFaliure,
+    IpAddress,
+    Computer,
+    LogInAttempts,
+    TargetAccounts,
+    LogonTypes, 
+    FailureCodes,
+    FirstFailure,
+    LastFaliuregit
+| order by TimeGenerated desc 
+
+
+// Detects new autorun entries in the Windows registry, which may indicate persistence mechanisms used by malware or unauthorized software.
+// This query looks for Event ID 13, which corresponds to registry changes, and filters for changes made to the "Run" and "RunOnce" registry keys, which are commonly used for autorun entries.
+// This query searches for Sysmon logs instead of SecurityEvent
+Event
+| where EventID == 13
+| extend
+    Image = extract(@"Image: (.*?) TargetObject:", 1, RenderedDescription),
+    TargetObject = extract(@"TargetObject: (.*?) Details:", 1, RenderedDescription),
+    Details = extract(@"Details: (.*?) User:", 1, RenderedDescription),
+    User = extract(@"User: (.*)$", 1, RenderedDescription)
+| where TargetObject contains @"\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\"
+    or TargetObject contains @"\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce\"
+| project
+    TimeGenerated,
+    Computer,
+    User,
+    Image,
+    TargetObject,
+    Details
+| order by TimeGenerated desc
